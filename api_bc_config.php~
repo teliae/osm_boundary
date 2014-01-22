@@ -1,0 +1,142 @@
+<?php
+/*
+ * Detect and return all cross boundaries
+ * - query OSRM to fetch a route
+ * - query an postgis database storing all boundaires
+ * - return a json data as OSRM does plus arrays of countries
+ *
+ *
+ * Require PolyLine :
+ * - https://github.com/emcconville/google-map-polyline-encoding-tool
+ *
+ * Debian packages :
+ * - php5-curl
+ * - php5-pgsql
+ *
+ */
+require_once 'Polyline.php';
+
+
+function Decode($encoded_line) {
+  /*
+   * Decode encoded Polyline with Google algorithm
+   *
+   */
+  $points = Polyline::Decode($encoded_line);
+
+  return $points;
+}
+
+function QueryOSRM($qrystr) {
+  /* Query OSRM API
+   *
+   * $coords = [$lat_from, $lon_from, $lat_to, $lon_to]
+   */
+  $base_url = "http://router.project-osrm.org/viaroute?%s";
+
+  $url = sprintf($base_url, $qrystr);
+
+  $ch = curl_init();
+  // set URL and other appropriate options
+  curl_setopt($ch, CURLOPT_URL, $url);
+  curl_setopt($ch, CURLOPT_VERBOSE, FALSE);
+  curl_setopt($ch, CURLOPT_HEADER, FALSE);
+  curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+  curl_setopt($ch, CURLOPT_USERAGENT, "php curl module()");
+
+  // grab URL and pass it to the browser
+  $content = curl_exec($ch);
+  curl_close($ch);
+
+  return json_decode($content, TRUE);
+}
+
+function SqlLine($points) {
+  // Build the SQL part of LineString
+  $iter = sizeof($points) / 2;
+  $i = 0;
+  $coords = array();
+  while ($i < $iter) {
+    // Be careful of the reverse of Lon/Lat to Lat/Lon
+    array_push($coords, sprintf("ST_MakePoint(%f, %f)", $points[$i+1], $points[$i]));
+    $i = $i + 2;
+  }
+
+  $iter = sizeof($coords) / 2;
+  $i = 0;
+  $lines = array();
+  while ($i < $iter) {
+    array_push($lines, sprintf("ST_MakeLine(%s)", implode(", ", array($coords[$i], $coords[$i+1]))));
+    $i = $i + 2;
+  }
+
+  return $lines;
+}
+
+function SqlQuery($host, $port, $dbname, $user, $password, $table, $line) {
+  /*
+   * Query the dedicetd database
+   *
+   */
+  $dbconn = pg_connect("host=$host port=$port dbname=$dbname user=$user password=$password");
+
+  $query = sprintf('SELECT nom_dept FROM %s WHERE ST_Intersects(the_geom, %s ) = true;', $table, $line);
+
+  if (!pg_connection_busy($dbconn)) {
+    
+    // Prepare a query for execution
+    
+    $res2 = pg_query($dbconn, $query);
+    
+    if ($res2) {
+      $datas = pg_fetch_all($res2);
+    } else {
+      $datas = array();
+      print "query error";
+      print pg_result_error();
+      print pg_last_error();
+      print $query;
+    }
+  } else {
+    print "Connect error";
+  }
+  return $datas;
+}
+/*
+ * Configuration
+ *
+ *
+ */
+$host = "localhost";
+$port = 5432;
+$user = "web";
+$dbname = "boundary";
+$password = "Ojiw4uc8";
+$table = "departement";
+
+$qrystr = $_SERVER['QUERY_STRING'];
+
+if ($qrystr == "") {
+   print "ok";
+} else {
+  // call OSRM API
+  // May be we can filter the QUERY_STRING to improve security
+  $osrm = QueryOSRM($qrystr);
+  
+  // Points
+  $points = Decode($osrm['route_geometry']);
+  
+  // Build the SQL Query for LINESTRING
+  $lines = SqlLine($points);
+  
+  $depts = array();
+  
+  foreach( $lines as &$line) {
+    $data = SqlQuery($host, $port, $dbname, $user, $password, $table, $line);
+    $depts[$data[0]['nom_dept']] = $data[0]['nom_dept'];
+  }
+  
+  $osrm['depts'] = $depts;
+  print json_encode($osrm);
+}
+?>
